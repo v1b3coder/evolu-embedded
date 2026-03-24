@@ -13,7 +13,7 @@ This is a port of the TypeScript Evolu project at `../packages/common/src/local-
 ```bash
 cargo test                    # all unit tests (124 tests)
 cargo test -p evolu-core      # just core crate
-cargo test -p evolu-page-store # just host-storage backend
+cargo test -p evolu-stream-store # just host-storage backend
 cargo test -- --ignored       # integration tests (needs relay running)
 
 cargo build --release         # release build (all crates)
@@ -34,8 +34,8 @@ cargo test -p evolu-core varint_test_vectors
 Everything in `evolu-core` is generic over three traits. Each has separate implementations per platform.
 
 **`StorageBackend`** (`storage.rs`) — where is my data?
-- `evolu-page-store`: streaming encrypted index on USB host + host data cache
-- `evolu-file-storage`: simple Vec-backed, std-only, for demo/testing
+- `evolu-stream-store`: streaming encrypted index on USB host + host data cache
+- `evolu-file-store`: simple Vec-backed, std-only, for demo/testing
 
 **`Transport` + `MessageHandler`** (`transport.rs`) — how do I talk to the relay?
 - `evolu-ws-transport`: WebSocket via tungstenite (std, demo)
@@ -43,15 +43,16 @@ Everything in `evolu-core` is generic over three traits. Each has separate imple
 - USB CDC would be the embedded production implementation
 
 **`Platform`** (`platform.rs`) — clock and randomness
-- `StdPlatform` in `evolu-page-store::std_platform` (SystemTime + getrandom)
+- `evolu-std-platform` crate (SystemTime + getrandom)
 - STM32U5 would use RTC + hardware TRNG
 
 ## Crate Dependency Graph
 
 ```
 evolu-demo ──→ evolu-core (no_std)
-           ──→ evolu-page-store (std) ──→ evolu-core
-           ──→ evolu-file-storage (std) ──→ evolu-core
+           ──→ evolu-stream-store (std) ──→ evolu-core
+           ──→ evolu-file-store (std) ──→ evolu-core
+           ──→ evolu-std-platform (std) ──→ evolu-core
            ──→ evolu-ws-transport (std) ──→ evolu-core
 ```
 
@@ -79,14 +80,16 @@ evolu-demo ──→ evolu-core (no_std)
 - `transport.rs` — `Transport` + `MessageHandler` traits, `MockTransport` pair
 - `platform.rs` — `Platform` trait (clock + randomness)
 
-## evolu-page-store (host-storage backend)
+## evolu-stream-store (host-storage backend)
 
 - `host.rs` — `HostInterface` trait: index streaming + data cache (no clock/random — those are in `Platform`)
 - `file_host.rs` — `FileHost`: filesystem-backed `HostInterface` (index as `index.bin`, cache as `cache/*.bin`)
 - `index.rs` — streaming encrypted index: chunk-based AEAD, 28-byte entries, replay detection
 - `trusted_state.rs` — 64-byte on-chip state (`device_key`, `dir_sequence`, `clock`)
 - `storage.rs` — `HostStorage<H, P>: StorageBackend` wiring index + cache + trusted state
-- `std_platform.rs` (in `lib.rs`) — `StdPlatform: Platform` using SystemTime + getrandom
+## evolu-std-platform
+
+Standalone `StdPlatform: Platform` using `SystemTime` + `getrandom`. Independent crate — any other crate can depend on it.
 
 ## Protocol Wire Format
 

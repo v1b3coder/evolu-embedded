@@ -1,21 +1,21 @@
 [package]
-name = "evolu-page-store"
+name = "evolu-stream-store"
 version = "0.1.0"
 edition.workspace = true
 license.workspace = true
-description = "Host-storage backend for Evolu — streaming encrypted index + host data cache"
+description = "Stream-storage backend for Evolu — streaming encrypted index on untrusted host + host data cache"
 
 [features]
 default = ["std"]
-std = ["getrandom"]
+std = []
 
 [dependencies]
 evolu-core = { workspace = true }
 chacha20poly1305 = { workspace = true }
 sha2 = { workspace = true }
 heapless = { workspace = true }
-getrandom = { workspace = true, optional = true }
 
 [dev-dependencies]
+evolu-std-platform = { workspace = true }
 tempfile = { workspace = true }
 getrandom = { workspace = true }

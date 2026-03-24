@@ -179,7 +179,7 @@ mod tests {
         ))
     }
 
-    use crate::std_platform::StdPlatform;
+    use evolu_std_platform::StdPlatform;
 
     fn create_storage() -> HostStorage<FileHost, StdPlatform> {
         let dir = tempfile::tempdir().unwrap();

@@ -360,7 +360,7 @@ mod tests {
         }
     }
 
-    use crate::std_platform::StdPlatform;
+    use evolu_std_platform::StdPlatform;
 
     fn make_trusted() -> TrustedState {
         TrustedState::new([0x42; 32])

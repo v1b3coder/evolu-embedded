@@ -2,8 +2,9 @@
 resolver = "2"
 members = [
     "crates/evolu-core",
-    "crates/evolu-page-store",
-    "crates/evolu-file-storage",
+    "crates/evolu-stream-store",
+    "crates/evolu-file-store",
+    "crates/evolu-std-platform",
     "crates/evolu-ws-transport",
     "crates/evolu-demo",
 ]
@@ -23,13 +24,13 @@ heapless = "0.8"
 
 # Internal
 evolu-core = { path = "crates/evolu-core" }
-evolu-page-store = { path = "crates/evolu-page-store" }
-evolu-file-storage = { path = "crates/evolu-file-storage" }
+evolu-stream-store = { path = "crates/evolu-stream-store" }
+evolu-file-store = { path = "crates/evolu-file-store" }
+evolu-std-platform = { path = "crates/evolu-std-platform" }
 evolu-ws-transport = { path = "crates/evolu-ws-transport" }
 
 # WebSocket (std only)
 tungstenite = { version = "0.24", features = ["native-tls"] }
-url = "2"
 
 # Testing only (std)
 getrandom = { version = "0.2", features = ["std"] }

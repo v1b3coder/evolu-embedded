@@ -49,13 +49,13 @@ pub trait StorageBackend {
 }
 ```
 
-**evolu-page-store** — for untrusted USB host:
+**evolu-stream-store** — for untrusted USB host:
 - Timestamp index: streaming encrypted chunks (AEAD per chunk, signed)
 - Data: cached on host as raw EncryptedDbChange blobs (already AEAD by protocol)
 - 64 bytes on-chip trusted state for replay detection
 - Designed for ~2.5 KB SRAM working set
 
-**evolu-file-storage** — simple Vec-backed demo/testing:
+**evolu-file-store** — simple Vec-backed demo/testing:
 - Everything in memory, serialized to a single file
 - No encryption, no streaming
 - std only
@@ -163,15 +163,18 @@ evolu-embedded/
 │   │   ├── sync.rs              # RBSR bucket computation
 │   │   └── relay.rs             # RelayClient (callback-driven sync)
 │   │
-│   ├── evolu-page-store/        # Host-storage backend (std)
+│   ├── evolu-stream-store/        # Host-storage backend (std)
 │   │   ├── host.rs              # HostInterface trait (index streaming + data cache)
 │   │   ├── file_host.rs         # FileHost: HostInterface backed by filesystem
 │   │   ├── index.rs             # Streaming encrypted index (chunk-based AEAD)
 │   │   ├── storage.rs           # HostStorage: StorageBackend implementation
 │   │   └── trusted_state.rs     # On-chip trusted state (64 bytes)
 │   │
-│   ├── evolu-file-storage/      # File-storage backend (std, demo/testing)
+│   ├── evolu-file-store/        # File-storage backend (std, demo/testing)
 │   │   └── lib.rs               # FileStorage: simple Vec-backed StorageBackend
+│   │
+│   ├── evolu-std-platform/      # Platform implementation (std)
+│   │   └── lib.rs               # StdPlatform: SystemTime + getrandom
 │   │
 │   ├── evolu-ws-transport/      # WebSocket transport (std, demo/testing)
 │   │   └── lib.rs               # WsTransport: tungstenite WebSocket + TLS
@@ -208,8 +211,8 @@ cargo run -p evolu-demo -- ws://localhost:4000
 rm -r /tmp/evolu-demo
 ```
 
-Client A uses `evolu-page-store` (encrypted index + host cache).
-Client B uses `evolu-file-storage` (simple Vec in memory).
+Client A uses `evolu-stream-store` (encrypted index + host cache).
+Client B uses `evolu-file-store` (simple Vec in memory).
 Both sync through the same relay using the same `StorageBackend` trait.
 
 ## Cross-compilation

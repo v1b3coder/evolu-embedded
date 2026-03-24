@@ -22,11 +22,11 @@ use evolu_core::storage::StorageBackend;
 use evolu_core::timestamp::timestamp_to_bytes;
 use evolu_core::transport::Transport;
 use evolu_core::types::*;
-use evolu_file_storage::FileStorage;
-use evolu_page_store::file_host::FileHost;
-use evolu_page_store::std_platform::StdPlatform;
-use evolu_page_store::storage::HostStorage;
-use evolu_page_store::trusted_state::{self, TrustedState};
+use evolu_file_store::FileStorage;
+use evolu_std_platform::StdPlatform;
+use evolu_stream_store::file_host::FileHost;
+use evolu_stream_store::storage::HostStorage;
+use evolu_stream_store::trusted_state::{self, TrustedState};
 use evolu_ws_transport::{base64url_encode, WsTransport};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,7 +53,7 @@ fn main() {
     // ── Client A: host-storage backend ──────────────────────────
 
     std::thread::sleep(Duration::from_millis(111));
-    println!("━━━ Client A (evolu-page-store) ━━━");
+    println!("━━━ Client A (evolu-stream-store) ━━━");
     let storage_dir = PathBuf::from(DATA_DIR).join("client-a");
     let trusted_path = storage_dir.join("trusted_state.bin");
 
@@ -74,7 +74,7 @@ fn main() {
     // ── Client B: flash-storage backend ─────────────────────────
 
     std::thread::sleep(Duration::from_millis(111));
-    println!("━━━ Client B (evolu-file-storage) ━━━");
+    println!("━━━ Client B (evolu-file-store) ━━━");
     let mut storage_b = load_or_create_file_storage();
 
     run_client("B", &relay_url, &owner, "bbbbbbbbbbbbbbbb", &mut storage_b);

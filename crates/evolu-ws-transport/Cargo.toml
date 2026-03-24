@@ -15,4 +15,3 @@ tungstenite = { workspace = true }
 
 [dev-dependencies]
 getrandom = { workspace = true }
-evolu-page-store = { workspace = true, features = ["std"] }
