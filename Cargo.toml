@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/evolu-core",
+    "crates/evolu-page-store",
+    "crates/evolu-file-storage",
+    "crates/evolu-ws-transport",
+    "crates/evolu-demo",
+]
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+# RustCrypto — all no_std compatible
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["heapless"] }
+sha2 = { version = "0.10", default-features = false }
+hmac = { version = "0.12", default-features = false }
+
+# no_std collections
+heapless = "0.8"
+
+# Internal
+evolu-core = { path = "crates/evolu-core" }
+evolu-page-store = { path = "crates/evolu-page-store" }
+evolu-file-storage = { path = "crates/evolu-file-storage" }
+evolu-ws-transport = { path = "crates/evolu-ws-transport" }
+
+# WebSocket (std only)
+tungstenite = { version = "0.24", features = ["native-tls"] }
+url = "2"
+
+# Testing only (std)
+getrandom = { version = "0.2", features = ["std"] }
+tempfile = "3"
