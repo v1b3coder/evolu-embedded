@@ -9,29 +9,38 @@ Minimal Evolu CRDT sync endpoint in pure Rust for STM32U5 (Cortex-M33) embedded 
 ## Architecture
 
 ```
-┌───────────────────────────────────────────────────────────┐
-│                       evolu-core                           │
-│            no_std, pure Rust, compiles for STM32U5        │
+┌─ evolu-core (no_std) ─────────────────────────────────────┐
 │                                                           │
-│  StorageBackend    Transport + MessageHandler    Platform  │
-│  ┌──────────┐      ┌──────────────────────┐    ┌────────┐│
-│  │          │      │                      │    │        ││
-│  └────┬─────┘      └──────────┬───────────┘    └───┬────┘│
-│       │                       │                    │     │
-│  Protocol · Sync · Relay · Crypto · HLC · CRDT · Message │
-└───────┼───────────────────────┼────────────────────┼─────┘
-        │                       │                    │
-   ┌────┴──────────┐     ┌─────┴──────────┐   ┌────┴────────┐
-   │ Storage       │     │ Transport      │   │ Platform     │
-   │ backends      │     │ implementations│   │ impl         │
-   ├───────────────┤     ├────────────────┤   ├──────────────┤
-   │evolu-stream-  │     │evolu-ws-       │   │evolu-std-    │
-   │  store (std)  │     │  transport(std)│   │  platform    │
-   │               │     │                │   │  (std)       │
-   │evolu-file-    │     │USB CDC         │   │              │
-   │  store (std)  │     │  (embedded)    │   │STM32U5 RTC + │
-   │               │     │                │   │  TRNG (embed)│
-   └───────────────┘     └────────────────┘   └──────────────┘
+│  Traits (implemented externally):                         │
+│  ┌───────────────┐ ┌─────────────────────┐ ┌──────────┐  │
+│  │StorageBackend │ │Transport +          │ │Platform  │  │
+│  │               │ │  MessageHandler     │ │          │  │
+│  └───────┬───────┘ └──────────┬──────────┘ └────┬─────┘  │
+│          │                    │                  │        │
+│  Internal modules (use the traits above):                │
+│  ┌───────┴────────────────────┴──────────────────┴─────┐  │
+│  │ relay.rs     ← sync session, drives the protocol    │  │
+│  │ message.rs   ← builds wire-compatible messages      │  │
+│  │ protocol.rs  ← binary codec, EncryptedDbChange      │  │
+│  │ sync.rs      ← RBSR bucket computation              │  │
+│  │ crdt.rs      ← LWW per-column merge                 │  │
+│  │ timestamp.rs ← Hybrid Logical Clock                  │  │
+│  │ crypto.rs    ← SLIP-21, PADME, SHA-256 fingerprints │  │
+│  │ owner.rs     ← key derivation from OwnerSecret      │  │
+│  │ types.rs     ← Millis, Counter, NodeId, Buffer       │  │
+│  └──────────────────────────────────────────────────────┘  │
+└───────────────────────────────────────────────────────────┘
+        │                    │                  │
+        ▼                    ▼                  ▼
+  ┌─────────────┐   ┌──────────────┐   ┌──────────────┐
+  │evolu-stream-│   │evolu-ws-     │   │evolu-std-    │
+  │  store      │   │  transport   │   │  platform    │
+  │  (std)      │   │  (std)       │   │  (std)       │
+  ├─────────────┤   ├──────────────┤   ├──────────────┤
+  │evolu-file-  │   │USB CDC       │   │STM32U5 RTC + │
+  │  store      │   │  (embedded)  │   │  TRNG        │
+  │  (std)      │   │              │   │  (embedded)  │
+  └─────────────┘   └──────────────┘   └──────────────┘
 ```
 
 ### Three core traits
