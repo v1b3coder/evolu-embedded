@@ -1,12 +1,12 @@
-//! Host interface for the host-storage backend.
+//! Host interface — pure storage operations.
 //!
 //! The host stores:
 //! - **Timestamp index**: one sequential blob, streamed in chunks
 //! - **Data cache**: key-value store (timestamp → EncryptedDbChange blob)
-//!   Data is already AEAD-encrypted by the protocol, so no additional
-//!   encryption is needed for the cache.
 
-/// Host interface for index and data cache operations.
+/// Host storage interface (index + data cache).
+///
+/// No clock or randomness — those are in `evolu_core::platform::Platform`.
 pub trait HostInterface {
     type Error: core::fmt::Debug;
 
@@ -27,22 +27,12 @@ pub trait HostInterface {
     /// Commit the new index, atomically replacing the old one.
     fn index_write_commit(&mut self) -> Result<(), Self::Error>;
 
-    // ── Data cache (raw EncryptedDbChange blobs) ────────────────
+    // ── Data cache ──────────────────────────────────────────────
 
     /// Store a data blob keyed by timestamp.
-    /// The blob is an EncryptedDbChange — already AEAD-authenticated
-    /// by the protocol layer. No additional encryption needed.
     fn cache_store(&mut self, key: &[u8; 16], data: &[u8]) -> Result<(), Self::Error>;
 
     /// Read a cached data blob by timestamp key into the buffer.
     /// Returns the number of bytes read, or 0 if not cached.
     fn cache_read(&mut self, key: &[u8; 16], buf: &mut [u8]) -> Result<usize, Self::Error>;
-
-    // ── Utilities ───────────────────────────────────────────────
-
-    /// Current time in milliseconds since Unix epoch.
-    fn now_millis(&self) -> u64;
-
-    /// Fill buffer with cryptographically secure random bytes.
-    fn fill_random(&mut self, buf: &mut [u8]);
 }

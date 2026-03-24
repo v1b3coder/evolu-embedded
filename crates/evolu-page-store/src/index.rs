@@ -30,6 +30,7 @@
 
 use crate::host::HostInterface;
 use crate::trusted_state::TrustedState;
+use evolu_core::platform::Platform;
 use chacha20poly1305::{
     aead::{AeadInPlace, KeyInit},
     Tag, XChaCha20Poly1305, XNonce,
@@ -223,8 +224,9 @@ where
 /// Updates `trusted.dir_sequence` with the new sequence.
 ///
 /// **After calling this, persist trusted_state to on-chip flash.**
-pub fn write_index<H: HostInterface, I>(
+pub fn write_index<H: HostInterface, P: Platform, I>(
     host: &mut H,
+    platform: &mut P,
     trusted: &mut TrustedState,
     entries: I,
     total_entries: u32,
@@ -236,7 +238,7 @@ where
     let sequence = trusted.dir_sequence;
 
     let mut nonce_seed = [0u8; 24];
-    host.fill_random(&mut nonce_seed);
+    platform.fill_random(&mut nonce_seed);
 
     // Write header
     let mut hdr = [0u8; HEADER_SIZE];
@@ -358,8 +360,14 @@ mod tests {
         }
     }
 
+    use crate::std_platform::StdPlatform;
+
     fn make_trusted() -> TrustedState {
         TrustedState::new([0x42; 32])
+    }
+
+    fn make_platform() -> StdPlatform {
+        StdPlatform
     }
 
     #[test]
@@ -379,7 +387,7 @@ mod tests {
         let mut trusted = make_trusted();
 
         let entry = make_entry(1000, 1);
-        write_index(&mut host, &mut trusted, core::iter::once(entry), 1).unwrap();
+        write_index(&mut host, &mut make_platform(), &mut trusted, core::iter::once(entry), 1).unwrap();
 
         let mut entries = Vec::new();
         read_index(&mut host, &trusted, |e, _| {
@@ -404,6 +412,7 @@ mod tests {
 
         write_index(
             &mut host,
+            &mut make_platform(),
             &mut trusted,
             entries.iter().copied(),
             entries.len() as u32,
@@ -434,6 +443,7 @@ mod tests {
 
         write_index(
             &mut host,
+            &mut make_platform(),
             &mut trusted,
             entries.iter().copied(),
             100,
@@ -459,7 +469,7 @@ mod tests {
             .map(|i| make_entry(i * 100, 1))
             .collect();
 
-        write_index(&mut host, &mut trusted, entries.iter().copied(), 50).unwrap();
+        write_index(&mut host, &mut make_platform(), &mut trusted, entries.iter().copied(), 50).unwrap();
 
         let mut count = 0u32;
         read_index(&mut host, &trusted, |_, _| {
@@ -478,6 +488,7 @@ mod tests {
 
         write_index(
             &mut host,
+            &mut make_platform(),
             &mut trusted,
             core::iter::once(make_entry(1000, 1)),
             1,
@@ -503,6 +514,7 @@ mod tests {
         // Write version 1
         write_index(
             &mut host,
+            &mut make_platform(),
             &mut trusted,
             core::iter::once(make_entry(1000, 1)),
             1,
@@ -513,6 +525,7 @@ mod tests {
         // Write version 2 (trusted state advances)
         write_index(
             &mut host,
+            &mut make_platform(),
             &mut trusted,
             [make_entry(1000, 1), make_entry(2000, 1)].iter().copied(),
             2,
@@ -536,7 +549,7 @@ mod tests {
             .map(|i| make_entry(i * 100, 1))
             .collect();
 
-        write_index(&mut host, &mut trusted, entries.iter().copied(), 10).unwrap();
+        write_index(&mut host, &mut make_platform(), &mut trusted, entries.iter().copied(), 10).unwrap();
 
         // Compute fingerprint for range [2, 7) by streaming
         let mut fp = ZERO_FINGERPRINT;
@@ -575,7 +588,7 @@ mod tests {
             page_id: 42,
         };
 
-        write_index(&mut host, &mut trusted, core::iter::once(entry), 1).unwrap();
+        write_index(&mut host, &mut make_platform(), &mut trusted, core::iter::once(entry), 1).unwrap();
 
         // Read raw file
         let raw = std::fs::read(dir.path().join("index.bin")).unwrap();
@@ -594,10 +607,10 @@ mod tests {
         let mut trusted = make_trusted();
         assert_eq!(trusted.dir_sequence, 0);
 
-        write_index(&mut host, &mut trusted, core::iter::empty(), 0).unwrap();
+        write_index(&mut host, &mut make_platform(), &mut trusted, core::iter::empty(), 0).unwrap();
         assert_eq!(trusted.dir_sequence, 1);
 
-        write_index(&mut host, &mut trusted, core::iter::empty(), 0).unwrap();
+        write_index(&mut host, &mut make_platform(), &mut trusted, core::iter::empty(), 0).unwrap();
         assert_eq!(trusted.dir_sequence, 2);
     }
 

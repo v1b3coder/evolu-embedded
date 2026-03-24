@@ -7,7 +7,6 @@ use crate::host::HostInterface;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub struct FileHost {
     base_dir: PathBuf,
@@ -103,15 +102,6 @@ impl HostInterface for FileHost {
         }
     }
 
-    // ── Utilities ───────────────────────────────────────────────
-
-    fn now_millis(&self) -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
-    }
-
-    fn fill_random(&mut self, buf: &mut [u8]) {
-        getrandom::getrandom(buf).expect("getrandom failed");
-    }
 }
 
 #[cfg(test)]

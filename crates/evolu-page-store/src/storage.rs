@@ -6,6 +6,7 @@ use crate::host::HostInterface;
 use crate::index::{self, IndexEntry, IndexError};
 use crate::trusted_state::TrustedState;
 use evolu_core::crypto::timestamp_to_fingerprint;
+use evolu_core::platform::Platform;
 use evolu_core::storage::StorageBackend;
 use evolu_core::types::*;
 
@@ -31,27 +32,23 @@ impl From<IndexError> for HostStorageError {
 /// - Data: stored in host cache as raw EncryptedDbChange blobs
 ///
 /// After any mutation, persist `trusted_state()` to on-chip flash.
-pub struct HostStorage<H: HostInterface> {
+pub struct HostStorage<H: HostInterface, P: Platform> {
     host: H,
+    platform: P,
     trusted: TrustedState,
-    /// Buffer for cache reads.
     cache_buf: [u8; CACHE_BUF_SIZE],
-    /// Length of valid data in cache_buf after last read.
     cache_len: usize,
 }
 
-impl<H: HostInterface> HostStorage<H> {
-    pub fn new(host: H, trusted: TrustedState) -> Self {
+impl<H: HostInterface, P: Platform> HostStorage<H, P> {
+    pub fn new(host: H, platform: P, trusted: TrustedState) -> Self {
         HostStorage {
             host,
+            platform,
             trusted,
             cache_buf: [0u8; CACHE_BUF_SIZE],
             cache_len: 0,
         }
-    }
-
-    pub fn new_with_key(host: H, device_key: [u8; 32]) -> Self {
-        Self::new(host, TrustedState::new(device_key))
     }
 
     pub fn host(&self) -> &H {
@@ -68,7 +65,7 @@ impl<H: HostInterface> HostStorage<H> {
     }
 }
 
-impl<H: HostInterface> StorageBackend for HostStorage<H> {
+impl<H: HostInterface, P: Platform> StorageBackend for HostStorage<H, P> {
     type Error = HostStorageError;
 
     fn size(&mut self) -> Result<u32, Self::Error> {
@@ -153,7 +150,7 @@ impl<H: HostInterface> StorageBackend for HostStorage<H> {
 
         // Rewrite index
         let count = entries.len() as u32;
-        index::write_index(&mut self.host, &mut self.trusted, entries.into_iter(), count)?;
+        index::write_index(&mut self.host, &mut self.platform, &mut self.trusted, entries.into_iter(), count)?;
 
         Ok(())
     }
@@ -182,10 +179,13 @@ mod tests {
         ))
     }
 
-    fn create_storage() -> HostStorage<FileHost> {
+    use crate::std_platform::StdPlatform;
+
+    fn create_storage() -> HostStorage<FileHost, StdPlatform> {
         let dir = tempfile::tempdir().unwrap();
         let host = FileHost::new(dir.into_path()).unwrap();
-        HostStorage::new_with_key(host, [0x42; 32])
+        let trusted = TrustedState::new([0x42; 32]);
+        HostStorage::new(host, StdPlatform, trusted)
     }
 
     #[test]

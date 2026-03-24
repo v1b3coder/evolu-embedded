@@ -6,6 +6,7 @@ pub mod crypto;
 pub mod owner;
 pub mod protocol;
 pub mod crdt;
+pub mod platform;
 pub mod storage;
 pub mod transport;
 pub mod sync;

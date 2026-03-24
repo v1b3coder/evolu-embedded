@@ -24,6 +24,7 @@ use evolu_core::transport::Transport;
 use evolu_core::types::*;
 use evolu_file_storage::FileStorage;
 use evolu_page_store::file_host::FileHost;
+use evolu_page_store::std_platform::StdPlatform;
 use evolu_page_store::storage::HostStorage;
 use evolu_page_store::trusted_state::{self, TrustedState};
 use evolu_ws_transport::{base64url_encode, WsTransport};
@@ -62,7 +63,7 @@ fn main() {
     });
 
     let host = FileHost::new(&storage_dir).unwrap();
-    let mut storage_a = HostStorage::new(host, trusted);
+    let mut storage_a = HostStorage::new(host, StdPlatform, trusted);
 
     run_client("A", &relay_url, &owner, "aaaaaaaaaaaaaaaa", &mut storage_a);
 
