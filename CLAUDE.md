@@ -87,6 +87,7 @@ evolu-demo ──→ evolu-core (no_std)
 - `index.rs` — streaming encrypted index: chunk-based AEAD, 28-byte entries, replay detection
 - `trusted_state.rs` — 64-byte on-chip state (`device_key`, `dir_sequence`, `clock`)
 - `storage.rs` — `HostStorage<H, P>: StorageBackend` wiring index + cache + trusted state
+
 ## evolu-std-platform
 
 Standalone `StdPlatform: Platform` using `SystemTime` + `getrandom`. Independent crate — any other crate can depend on it.

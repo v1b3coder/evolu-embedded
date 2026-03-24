@@ -9,28 +9,44 @@ Minimal Evolu CRDT sync endpoint in pure Rust for STM32U5 (Cortex-M33) embedded 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    evolu-core                        │
-│         no_std, pure Rust, compiles for STM32U5     │
-│                                                     │
-│  StorageBackend trait    Transport trait             │
-│  ┌──────────┐            ┌──────────┐               │
-│  │          │            │          │               │
-│  └────┬─────┘            └────┬─────┘               │
-│       │                       │                     │
-│  Protocol · Sync · Relay · Crypto · HLC · CRDT      │
-└───────┼───────────────────────┼─────────────────────┘
-        │                       │
-   ┌────┴──────────┐     ┌─────┴──────────┐
-   │ Storage       │     │ Transport      │
-   │ backends      │     │ implementations│
-   ├───────────────┤     ├────────────────┤
-   │evolu-page-    │     │evolu-ws-       │
-   │  store (std)  │     │  transport(std)│
-   │               │     │                │
-   │evolu-file-    │     │USB CDC         │
-   │  storage (std)│     │  (embedded)    │
-   └───────────────┘     └────────────────┘
+┌───────────────────────────────────────────────────────────┐
+│                       evolu-core                           │
+│            no_std, pure Rust, compiles for STM32U5        │
+│                                                           │
+│  StorageBackend    Transport + MessageHandler    Platform  │
+│  ┌──────────┐      ┌──────────────────────┐    ┌────────┐│
+│  │          │      │                      │    │        ││
+│  └────┬─────┘      └──────────┬───────────┘    └───┬────┘│
+│       │                       │                    │     │
+│  Protocol · Sync · Relay · Crypto · HLC · CRDT · Message │
+└───────┼───────────────────────┼────────────────────┼─────┘
+        │                       │                    │
+   ┌────┴──────────┐     ┌─────┴──────────┐   ┌────┴────────┐
+   │ Storage       │     │ Transport      │   │ Platform     │
+   │ backends      │     │ implementations│   │ impl         │
+   ├───────────────┤     ├────────────────┤   ├──────────────┤
+   │evolu-stream-  │     │evolu-ws-       │   │evolu-std-    │
+   │  store (std)  │     │  transport(std)│   │  platform    │
+   │               │     │                │   │  (std)       │
+   │evolu-file-    │     │USB CDC         │   │              │
+   │  store (std)  │     │  (embedded)    │   │STM32U5 RTC + │
+   │               │     │                │   │  TRNG (embed)│
+   └───────────────┘     └────────────────┘   └──────────────┘
+```
+
+### Three core traits
+
+Everything in `evolu-core` is generic over three traits:
+
+- **`StorageBackend`** — where is my data?
+- **`Transport` + `MessageHandler`** — how do I talk to the relay?
+- **`Platform`** — what time is it, give me random bytes
+
+```rust
+pub trait Platform {
+    fn now_millis(&self) -> u64;
+    fn fill_random(&mut self, buf: &mut [u8]);
+}
 ```
 
 ### Two storage models
@@ -128,6 +144,7 @@ pub trait MessageHandler {
 - No address in `connect()` — the host knows the relay endpoint
 - Callback receive — the host pushes messages (interrupt-driven), no polling
 - `RelayClient` implements `MessageHandler` — wire to transport and sync runs automatically
+- `Platform` provides clock (for HLC timestamps) and randomness (for crypto nonces) — independent of storage and transport
 
 ## Protocol Compatibility
 
@@ -159,6 +176,7 @@ evolu-embedded/
 │   │   ├── message.rs           # Wire-compatible protocol message builder
 │   │   ├── crdt.rs              # LWW per-column merge logic
 │   │   ├── storage.rs           # StorageBackend trait definition
+│   │   ├── platform.rs          # Platform trait (clock + randomness)
 │   │   ├── transport.rs         # Transport + MessageHandler traits, mock pair
 │   │   ├── sync.rs              # RBSR bucket computation
 │   │   └── relay.rs             # RelayClient (callback-driven sync)
