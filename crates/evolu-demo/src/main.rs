@@ -25,7 +25,7 @@ use evolu_core::types::*;
 use evolu_file_store::FileStorage;
 use evolu_std_platform::StdPlatform;
 use evolu_stream_store::file_host::FileHost;
-use evolu_stream_store::storage::HostStorage;
+use evolu_stream_store::storage::StreamStorage;
 use evolu_stream_store::trusted_state::{self, TrustedState};
 use evolu_ws_transport::{base64url_encode, WsTransport};
 use std::path::PathBuf;
@@ -63,7 +63,7 @@ fn main() {
     });
 
     let host = FileHost::new(&storage_dir).unwrap();
-    let mut storage_a = HostStorage::new(host, StdPlatform, trusted);
+    let mut storage_a = StreamStorage::new(host, StdPlatform, trusted);
 
     run_client("A", &relay_url, &owner, "aaaaaaaaaaaaaaaa", &mut storage_a);
 
@@ -183,15 +183,23 @@ fn run_client<S: StorageBackend>(
         ws.poll_timeout(&mut client, Duration::from_secs(5))
             .unwrap_or_else(|_| panic!("Client {}: relay timeout (round {})", name, round));
 
-        // Store received messages
+        // Store received messages (batch insert — one index rewrite per round)
         let received_ts = client.received_timestamps().to_vec();
         let received_ch = client.received_changes().to_vec();
-        for (i, relay_ts) in received_ts.iter().enumerate() {
-            if i < received_ch.len() {
-                storage.insert(relay_ts, &received_ch[i]).unwrap();
-            } else {
-                storage.insert(relay_ts, &[]).unwrap();
-            }
+        let batch: Vec<(&TimestampBytes, &[u8])> = received_ts
+            .iter()
+            .enumerate()
+            .map(|(i, ts)| {
+                let data: &[u8] = if i < received_ch.len() {
+                    &received_ch[i]
+                } else {
+                    &[]
+                };
+                (ts, data)
+            })
+            .collect();
+        if !batch.is_empty() {
+            storage.insert_batch(&batch).unwrap();
         }
 
         if client.is_synced() {

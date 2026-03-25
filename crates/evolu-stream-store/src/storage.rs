@@ -1,8 +1,8 @@
-//! Host-storage backend: streaming encrypted index + host data cache.
+//! Stream-storage backend: streaming encrypted index + blob cache on host.
 //!
 //! Implements `StorageBackend` from `evolu-core`.
 
-use crate::host::HostInterface;
+use crate::host::HostStore;
 use crate::index::{self, IndexEntry, IndexError};
 use crate::trusted_state::TrustedState;
 use evolu_core::crypto::timestamp_to_fingerprint;
@@ -10,44 +10,44 @@ use evolu_core::platform::Platform;
 use evolu_core::storage::StorageBackend;
 use evolu_core::types::*;
 
-/// Maximum data blob size for cache reads.
-const CACHE_BUF_SIZE: usize = 4096;
+/// Maximum blob size for reads.
+const BLOB_BUF_SIZE: usize = 4096;
 
 #[derive(Clone, Debug, PartialEq)]
-pub enum HostStorageError {
+pub enum StreamStorageError {
     Host,
     Index(IndexError),
-    CacheFull,
 }
 
-impl From<IndexError> for HostStorageError {
+impl From<IndexError> for StreamStorageError {
     fn from(e: IndexError) -> Self {
-        HostStorageError::Index(e)
+        StreamStorageError::Index(e)
     }
 }
 
-/// Host-storage backend.
+/// Stream-storage backend.
 ///
-/// - Timestamp index: streamed from host, encrypted in chunks, signed
-/// - Data: stored in host cache as raw EncryptedDbChange blobs
+/// Uses a `HostStore` for persistent storage:
+/// - Encrypted timestamp index: streamed in chunks, device-managed
+/// - Blob cache: opaque EncryptedDbChange blobs, populated during sync
 ///
 /// After any mutation, persist `trusted_state()` to on-chip flash.
-pub struct HostStorage<H: HostInterface, P: Platform> {
+pub struct StreamStorage<H: HostStore, P: Platform> {
     host: H,
     platform: P,
     trusted: TrustedState,
-    cache_buf: [u8; CACHE_BUF_SIZE],
-    cache_len: usize,
+    blob_buf: [u8; BLOB_BUF_SIZE],
+    blob_len: usize,
 }
 
-impl<H: HostInterface, P: Platform> HostStorage<H, P> {
+impl<H: HostStore, P: Platform> StreamStorage<H, P> {
     pub fn new(host: H, platform: P, trusted: TrustedState) -> Self {
-        HostStorage {
+        StreamStorage {
             host,
             platform,
             trusted,
-            cache_buf: [0u8; CACHE_BUF_SIZE],
-            cache_len: 0,
+            blob_buf: [0u8; BLOB_BUF_SIZE],
+            blob_len: 0,
         }
     }
 
@@ -63,10 +63,23 @@ impl<H: HostInterface, P: Platform> HostStorage<H, P> {
     pub fn trusted_state(&self) -> &TrustedState {
         &self.trusted
     }
+
+    /// Boot-time validation and crash recovery.
+    ///
+    /// If the index was committed but `TrustedState` was not persisted
+    /// (power loss between index commit and flash write), this detects the
+    /// off-by-one sequence and recovers automatically.
+    ///
+    /// Call this after constructing `StreamStorage` and before any reads/writes.
+    /// **Persist `trusted_state()` to flash after this returns `Ok`.**
+    pub fn validate_and_recover(&mut self) -> Result<(), StreamStorageError> {
+        index::validate_and_recover(&mut self.host, &mut self.trusted)?;
+        Ok(())
+    }
 }
 
-impl<H: HostInterface, P: Platform> StorageBackend for HostStorage<H, P> {
-    type Error = HostStorageError;
+impl<H: HostStore, P: Platform> StorageBackend for StreamStorage<H, P> {
+    type Error = StreamStorageError;
 
     fn size(&mut self) -> Result<u32, Self::Error> {
         let header = index::read_index_header(&mut self.host)?;
@@ -117,51 +130,83 @@ impl<H: HostInterface, P: Platform> StorageBackend for HostStorage<H, P> {
     }
 
     fn insert(&mut self, ts: &TimestampBytes, data: &[u8]) -> Result<(), Self::Error> {
-        // Read existing entries
-        let mut entries: heapless::Vec<IndexEntry, 4096> = heapless::Vec::new();
-        index::read_index(&mut self.host, &self.trusted, |entry, _| {
-            let _ = entries.push(*entry);
-            true
-        })?;
+        self.insert_batch(&[(ts, data)])
+    }
 
-        // Check duplicate
-        if entries.iter().any(|e| e.timestamp == *ts) {
+    fn insert_batch(
+        &mut self,
+        entries: &[(&TimestampBytes, &[u8])],
+    ) -> Result<(), Self::Error> {
+        if entries.is_empty() {
             return Ok(());
         }
 
-        // Sorted insert
-        let pos = entries
-            .iter()
-            .position(|e| e.timestamp > *ts)
-            .unwrap_or(entries.len());
-
-        let new_entry = IndexEntry {
-            timestamp: *ts,
-            fingerprint: timestamp_to_fingerprint(ts),
-            page_id: 0, // unused in host-storage, kept for index format compat
-        };
-
-        entries.insert(pos, new_entry).map_err(|_| HostStorageError::CacheFull)?;
-
-        // Store data in host cache
-        if !data.is_empty() {
-            self.host.cache_store(ts, data).map_err(|_| HostStorageError::Host)?;
+        // Build sorted, deduplicated IndexEntry batch
+        let mut new_entries: heapless::Vec<IndexEntry, 256> = heapless::Vec::new();
+        for &(ts, _) in entries {
+            let entry = IndexEntry {
+                timestamp: *ts,
+                fingerprint: timestamp_to_fingerprint(ts),
+                page_id: 0,
+            };
+            new_entries.push(entry).map_err(|_| StreamStorageError::Index(IndexError::BatchFull))?;
+        }
+        // Sort by timestamp
+        new_entries.sort_unstable_by(|a, b| a.timestamp.cmp(&b.timestamp));
+        // Dedup (heapless::Vec lacks dedup_by)
+        if new_entries.len() > 1 {
+            let mut write = 0;
+            for read in 1..new_entries.len() {
+                if new_entries[read].timestamp != new_entries[write].timestamp {
+                    write += 1;
+                    new_entries[write] = new_entries[read];
+                }
+            }
+            new_entries.truncate(write + 1);
         }
 
-        // Rewrite index
-        let count = entries.len() as u32;
-        index::write_index(&mut self.host, &mut self.platform, &mut self.trusted, entries.into_iter(), count)?;
+        // Store blobs on host (each is individually atomic)
+        for &(ts, data) in entries {
+            if !data.is_empty() {
+                self.host.put_blob(ts, data).map_err(|_| StreamStorageError::Host)?;
+            }
+        }
+
+        // Pre-scan to count duplicates and compute total
+        let old_count = match index::read_index_header(&mut self.host)? {
+            Some((_, _, count)) => count,
+            None => 0,
+        };
+        let dup_count = index::pre_scan_duplicates(
+            &mut self.host,
+            &self.trusted,
+            &new_entries,
+        )?;
+        let new_unique = new_entries.len() as u32 - dup_count;
+        if new_unique == 0 {
+            return Ok(()); // all duplicates
+        }
+        let total = old_count + new_unique;
+
+        // Streaming merge-write
+        index::streaming_merge_write(
+            &mut self.host,
+            &mut self.platform,
+            &mut self.trusted,
+            &new_entries,
+            total,
+        )?;
 
         Ok(())
     }
 
     fn read(&mut self, ts: &TimestampBytes) -> Result<Option<&[u8]>, Self::Error> {
-        let n = self.host.cache_read(ts, &mut self.cache_buf).map_err(|_| HostStorageError::Host)?;
+        let n = self.host.get_blob(ts, &mut self.blob_buf).map_err(|_| StreamStorageError::Host)?;
         if n == 0 {
             return Ok(None);
         }
-        self.cache_len = n;
-        Ok(Some(&self.cache_buf[..self.cache_len]))
+        self.blob_len = n;
+        Ok(Some(&self.blob_buf[..self.blob_len]))
     }
 }
 
@@ -181,11 +226,11 @@ mod tests {
 
     use evolu_std_platform::StdPlatform;
 
-    fn create_storage() -> HostStorage<FileHost, StdPlatform> {
+    fn create_storage() -> StreamStorage<FileHost, StdPlatform> {
         let dir = tempfile::tempdir().unwrap();
         let host = FileHost::new(dir.into_path()).unwrap();
         let trusted = TrustedState::new([0x42; 32]);
-        HostStorage::new(host, StdPlatform, trusted)
+        StreamStorage::new(host, StdPlatform, trusted)
     }
 
     #[test]
@@ -224,7 +269,7 @@ mod tests {
     }
 
     #[test]
-    fn read_data() {
+    fn read_blob() {
         let mut s = create_storage();
         let ts = make_ts(100);
         s.insert(&ts, b"Hello world!").unwrap();
@@ -288,7 +333,7 @@ mod tests {
         s.insert(&make_ts(200), b"v2").unwrap();
 
         std::fs::write(s.host().base_dir().join("index.bin"), &old_idx).unwrap();
-        assert!(matches!(s.size(), Err(HostStorageError::Index(IndexError::TamperDetected))));
+        assert!(matches!(s.size(), Err(StreamStorageError::Index(IndexError::TamperDetected))));
     }
 
     #[test]
@@ -316,5 +361,140 @@ mod tests {
             true
         }).unwrap();
         assert_eq!(count, 100);
+    }
+
+    // ── insert_batch tests ──────────────────────────────────────
+
+    #[test]
+    fn batch_insert_multiple() {
+        let mut s = create_storage();
+        let ts1 = make_ts(100);
+        let ts2 = make_ts(200);
+        let ts3 = make_ts(50);
+        s.insert_batch(&[
+            (&ts1, b"a" as &[u8]),
+            (&ts2, b"b"),
+            (&ts3, b"c"),
+        ]).unwrap();
+        assert_eq!(s.size().unwrap(), 3);
+
+        // Verify sorted order
+        let mut ts_list = Vec::new();
+        s.iterate(0, 3, &mut |ts, _| { ts_list.push(*ts); true }).unwrap();
+        assert!(ts_list[0] < ts_list[1] && ts_list[1] < ts_list[2]);
+
+        // Verify blobs
+        assert_eq!(s.read(&ts1).unwrap().unwrap(), b"a");
+        assert_eq!(s.read(&ts2).unwrap().unwrap(), b"b");
+        assert_eq!(s.read(&ts3).unwrap().unwrap(), b"c");
+    }
+
+    #[test]
+    fn batch_with_duplicates_in_batch() {
+        let mut s = create_storage();
+        let ts = make_ts(100);
+        s.insert_batch(&[
+            (&ts, b"a" as &[u8]),
+            (&ts, b"a"),
+        ]).unwrap();
+        assert_eq!(s.size().unwrap(), 1);
+    }
+
+    #[test]
+    fn batch_with_existing_duplicates() {
+        let mut s = create_storage();
+        let ts1 = make_ts(100);
+        let ts2 = make_ts(200);
+        s.insert(&ts1, b"a").unwrap();
+
+        // Batch with ts1 (dup) and ts2 (new)
+        s.insert_batch(&[
+            (&ts1, b"a" as &[u8]),
+            (&ts2, b"b"),
+        ]).unwrap();
+        assert_eq!(s.size().unwrap(), 2);
+    }
+
+    #[test]
+    fn batch_all_duplicates() {
+        let mut s = create_storage();
+        let ts = make_ts(100);
+        s.insert(&ts, b"a").unwrap();
+
+        s.insert_batch(&[(&ts, b"a" as &[u8])]).unwrap();
+        assert_eq!(s.size().unwrap(), 1);
+    }
+
+    #[test]
+    fn batch_empty() {
+        let mut s = create_storage();
+        s.insert_batch(&[]).unwrap();
+        assert_eq!(s.size().unwrap(), 0);
+    }
+
+    #[test]
+    fn batch_then_single_insert() {
+        let mut s = create_storage();
+        let ts1 = make_ts(100);
+        let ts2 = make_ts(200);
+        let ts3 = make_ts(150);
+        s.insert_batch(&[
+            (&ts1, b"a" as &[u8]),
+            (&ts2, b"b"),
+        ]).unwrap();
+        s.insert(&ts3, b"c").unwrap();
+        assert_eq!(s.size().unwrap(), 3);
+
+        // Verify order: 100, 150, 200
+        let mut ts_list = Vec::new();
+        s.iterate(0, 3, &mut |ts, _| { ts_list.push(*ts); true }).unwrap();
+        assert_eq!(ts_list[0], ts1);
+        assert_eq!(ts_list[1], ts3);
+        assert_eq!(ts_list[2], ts2);
+    }
+
+    #[test]
+    fn batch_large_crosses_chunks() {
+        let mut s = create_storage();
+        // 130 entries in one batch — spans 3 chunks (64 + 64 + 2)
+        let timestamps: Vec<TimestampBytes> = (0..130).map(|i| make_ts(i * 10)).collect();
+        let batch: Vec<(&TimestampBytes, &[u8])> = timestamps
+            .iter()
+            .map(|ts| (ts, b"x" as &[u8]))
+            .collect();
+        s.insert_batch(&batch).unwrap();
+        assert_eq!(s.size().unwrap(), 130);
+
+        // Verify sorted
+        let mut prev = [0u8; 16];
+        let mut count = 0;
+        s.iterate(0, 130, &mut |ts, _| {
+            if count > 0 { assert!(ts > &prev); }
+            prev = *ts;
+            count += 1;
+            true
+        }).unwrap();
+        assert_eq!(count, 130);
+    }
+
+    // ── validate_and_recover tests ──────────────────────────────
+
+    #[test]
+    fn validate_and_recover_consistent() {
+        let mut s = create_storage();
+        s.insert(&make_ts(100), b"a").unwrap();
+        assert!(s.validate_and_recover().is_ok());
+    }
+
+    #[test]
+    fn validate_and_recover_off_by_one() {
+        let mut s = create_storage();
+        s.insert(&make_ts(100), b"a").unwrap();
+        // Simulate crash: roll back dir_sequence
+        let seq = s.trusted.dir_sequence;
+        s.trusted.dir_sequence = seq - 1;
+
+        assert!(s.validate_and_recover().is_ok());
+        assert_eq!(s.trusted.dir_sequence, seq);
     }
 }

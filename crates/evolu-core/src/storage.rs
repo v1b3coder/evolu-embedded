@@ -57,6 +57,21 @@ pub trait StorageBackend {
     /// Idempotent — inserting a duplicate timestamp is a no-op.
     fn insert(&mut self, ts: &TimestampBytes, data: &[u8]) -> Result<(), Self::Error>;
 
+    /// Batch insert multiple entries.
+    ///
+    /// Implementations that rewrite an index on every insert (e.g. streaming
+    /// encrypted index) override this to do a single merge-write for the
+    /// whole batch. The default loops `insert()`.
+    fn insert_batch(
+        &mut self,
+        entries: &[(&TimestampBytes, &[u8])],
+    ) -> Result<(), Self::Error> {
+        for &(ts, data) in entries {
+            self.insert(ts, data)?;
+        }
+        Ok(())
+    }
+
     /// Read the data payload associated with a timestamp.
     ///
     /// Returns:

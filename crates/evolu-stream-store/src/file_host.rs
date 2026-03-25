@@ -1,9 +1,9 @@
-//! File-backed `HostInterface` for development and testing.
+//! File-backed `HostStore` for development and testing.
 //!
 //! - Index: `{base_dir}/index.bin`
-//! - Cache: `{base_dir}/cache/{hex_key}.bin`
+//! - Blobs: `{base_dir}/blobs/{hex_ts}.bin`
 
-use crate::host::HostInterface;
+use crate::host::HostStore;
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -16,7 +16,7 @@ pub struct FileHost {
 impl FileHost {
     pub fn new(base_dir: impl Into<PathBuf>) -> io::Result<Self> {
         let base_dir = base_dir.into();
-        fs::create_dir_all(base_dir.join("cache"))?;
+        fs::create_dir_all(base_dir.join("blobs"))?;
         Ok(FileHost { base_dir, index_writer: None })
     }
 
@@ -32,13 +32,13 @@ impl FileHost {
         self.base_dir.join("index.bin.tmp")
     }
 
-    fn cache_path(&self, key: &[u8; 16]) -> PathBuf {
-        let hex: String = key.iter().map(|b| format!("{:02x}", b)).collect();
-        self.base_dir.join("cache").join(format!("{}.bin", hex))
+    fn blob_path(&self, ts: &[u8; 16]) -> PathBuf {
+        let hex: String = ts.iter().map(|b| format!("{:02x}", b)).collect();
+        self.base_dir.join("blobs").join(format!("{}.bin", hex))
     }
 }
 
-impl HostInterface for FileHost {
+impl HostStore for FileHost {
     type Error = io::Error;
 
     // ── Index ───────────────────────────────────────────────────
@@ -76,21 +76,22 @@ impl HostInterface for FileHost {
     fn index_write_commit(&mut self) -> Result<(), Self::Error> {
         if let Some(mut w) = self.index_writer.take() {
             w.flush()?;
+            w.sync_data()?;
         }
         fs::rename(self.index_tmp_path(), self.index_path())
     }
 
-    // ── Data cache ──────────────────────────────────────────────
+    // ── Blob cache ──────────────────────────────────────────────
 
-    fn cache_store(&mut self, key: &[u8; 16], data: &[u8]) -> Result<(), Self::Error> {
-        let path = self.cache_path(key);
+    fn put_blob(&mut self, ts: &[u8; 16], data: &[u8]) -> Result<(), Self::Error> {
+        let path = self.blob_path(ts);
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, data)?;
         fs::rename(&tmp, &path)
     }
 
-    fn cache_read(&mut self, key: &[u8; 16], buf: &mut [u8]) -> Result<usize, Self::Error> {
-        let path = self.cache_path(key);
+    fn get_blob(&mut self, ts: &[u8; 16], buf: &mut [u8]) -> Result<usize, Self::Error> {
+        let path = self.blob_path(ts);
         match fs::read(&path) {
             Ok(data) => {
                 let len = data.len().min(buf.len());
@@ -101,7 +102,6 @@ impl HostInterface for FileHost {
             Err(e) => Err(e),
         }
     }
-
 }
 
 #[cfg(test)]
@@ -132,39 +132,38 @@ mod tests {
     }
 
     #[test]
-    fn cache_store_read() {
+    fn blob_put_get() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = FileHost::new(dir.path()).unwrap();
 
-        let key = [0xAA; 16];
-        host.cache_store(&key, b"encrypted data here").unwrap();
+        let ts = [0xAA; 16];
+        host.put_blob(&ts, b"encrypted data here").unwrap();
 
         let mut buf = [0u8; 256];
-        let n = host.cache_read(&key, &mut buf).unwrap();
+        let n = host.get_blob(&ts, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"encrypted data here");
     }
 
     #[test]
-    fn cache_miss() {
+    fn blob_miss() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = FileHost::new(dir.path()).unwrap();
 
-        let key = [0xBB; 16];
         let mut buf = [0u8; 256];
-        assert_eq!(host.cache_read(&key, &mut buf).unwrap(), 0);
+        assert_eq!(host.get_blob(&[0xBB; 16], &mut buf).unwrap(), 0);
     }
 
     #[test]
-    fn cache_overwrite() {
+    fn blob_overwrite() {
         let dir = tempfile::tempdir().unwrap();
         let mut host = FileHost::new(dir.path()).unwrap();
 
-        let key = [0xCC; 16];
-        host.cache_store(&key, b"v1").unwrap();
-        host.cache_store(&key, b"v2").unwrap();
+        let ts = [0xCC; 16];
+        host.put_blob(&ts, b"v1").unwrap();
+        host.put_blob(&ts, b"v2").unwrap();
 
         let mut buf = [0u8; 256];
-        let n = host.cache_read(&key, &mut buf).unwrap();
+        let n = host.get_blob(&ts, &mut buf).unwrap();
         assert_eq!(&buf[..n], b"v2");
     }
 }
