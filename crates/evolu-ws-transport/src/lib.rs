@@ -10,9 +10,9 @@
 //! use evolu_ws_transport::WsTransport;
 //! use evolu_core::transport::Transport;
 //!
-//! let owner_id_bytes = [0u8; 16];
-//! let mut ws = WsTransport::new("ws://localhost:4000", &owner_id_bytes);
-//! ws.connect().unwrap();
+//! let owner_id = [0u8; 16];
+//! let mut ws = WsTransport::new("ws://localhost:4000");
+//! ws.connect(&owner_id).unwrap();
 //! ws.send(&[1, 2, 3]).unwrap();
 //! ```
 
@@ -30,7 +30,6 @@ use tungstenite::WebSocket;
 /// parameter is appended automatically.
 pub struct WsTransport {
     relay_url: String,
-    owner_id_base64url: String,
     socket: Option<WebSocket<MaybeTlsStream<std::net::TcpStream>>>,
     state: ConnectionState,
 }
@@ -39,12 +38,9 @@ impl WsTransport {
     /// Create a new WebSocket transport.
     ///
     /// - `relay_url`: Base relay URL, e.g. `"ws://localhost:4000"` or `"wss://free.evoluhq.com"`
-    /// - `owner_id_bytes`: 16-byte OwnerIdBytes. Converted to base64url for the URL query parameter.
-    pub fn new(relay_url: &str, owner_id_bytes: &[u8; 16]) -> Self {
-        let owner_id_base64url = base64url_encode(owner_id_bytes);
+    pub fn new(relay_url: &str) -> Self {
         WsTransport {
             relay_url: relay_url.to_string(),
-            owner_id_base64url,
             socket: None,
             state: ConnectionState::Disconnected,
         }
@@ -149,10 +145,10 @@ impl WsTransport {
 }
 
 impl Transport for WsTransport {
-    fn connect(&mut self) -> Result<(), TransportError> {
-        // Ensure the URL has a path before the query string
+    fn connect(&mut self, owner_id: &[u8; 16]) -> Result<(), TransportError> {
         let base = self.relay_url.trim_end_matches('/');
-        let full_url = format!("{}/?ownerId={}", base, self.owner_id_base64url);
+        let owner_id_b64 = base64url_encode(owner_id);
+        let full_url = format!("{}/?ownerId={}", base, owner_id_b64);
 
         self.state = ConnectionState::Connecting;
 
@@ -249,26 +245,17 @@ mod tests {
     }
 
     #[test]
-    fn ws_transport_creates_url() {
-        let owner_id: [u8; 16] = [
-            0x4a, 0xd6, 0xef, 0x75, 0x33, 0xf1, 0x93, 0xcd, 0x33, 0xd1, 0xc3, 0x55, 0xc0, 0x32,
-            0x60, 0xea,
-        ];
-        let ws = WsTransport::new("ws://localhost:4000", &owner_id);
+    fn ws_transport_creates_with_url() {
+        let ws = WsTransport::new("ws://localhost:4000");
         assert_eq!(ws.state(), ConnectionState::Disconnected);
-        // The URL should include the base64url-encoded ownerId
-        let expected_url = format!("ws://localhost:4000?ownerId={}", base64url_encode(&owner_id));
-        assert_eq!(
-            format!("{}?ownerId={}", ws.relay_url, ws.owner_id_base64url),
-            expected_url
-        );
+        assert_eq!(ws.relay_url, "ws://localhost:4000");
     }
 
     #[test]
     fn connect_to_nonexistent_relay() {
         let owner_id = [0u8; 16];
-        let mut ws = WsTransport::new("ws://127.0.0.1:59999", &owner_id);
-        let result = ws.connect();
+        let mut ws = WsTransport::new("ws://127.0.0.1:59999");
+        let result = ws.connect(&owner_id);
         assert_eq!(result, Err(TransportError::ConnectionFailed));
         assert_eq!(ws.state(), ConnectionState::Disconnected);
     }
@@ -290,8 +277,8 @@ mod tests {
         println!("Owner ID (base64url): {}", base64url_encode(&owner.id));
         println!("Connecting to ws://localhost:4000...");
 
-        let mut ws = WsTransport::new("ws://localhost:4000", &owner.id);
-        ws.connect().expect("Failed to connect to local relay (is it running on port 4000?)");
+        let mut ws = WsTransport::new("ws://localhost:4000");
+        ws.connect(&owner.id).expect("Failed to connect to local relay (is it running on port 4000?)");
 
         assert_eq!(ws.state(), ConnectionState::Connected);
         println!("Connected!");
@@ -348,8 +335,8 @@ mod tests {
         // ── Client A: send a CRDT message to the relay ──────────
 
         println!("\n--- Client A: connecting and sending data ---");
-        let mut ws_a = WsTransport::new("ws://localhost:4000", &owner.id);
-        ws_a.connect().expect("Client A: connection failed");
+        let mut ws_a = WsTransport::new("ws://localhost:4000");
+        ws_a.connect(&owner.id).expect("Client A: connection failed");
 
         // Create a CRDT message
         let ts = timestamp_to_bytes(&Timestamp::new(
@@ -423,8 +410,8 @@ mod tests {
         // ── Client B: connect and sync — should receive the message ─
 
         println!("\n--- Client B: connecting and syncing ---");
-        let mut ws_b = WsTransport::new("ws://localhost:4000", &owner.id);
-        ws_b.connect().expect("Client B: connection failed");
+        let mut ws_b = WsTransport::new("ws://localhost:4000");
+        ws_b.connect(&owner.id).expect("Client B: connection failed");
 
         let mut client_b = RelayClient::new(&owner.id, &owner.encryption_key, Some(&owner.write_key));
         let mut empty_b = evolu_file_store::FileStorage::new();

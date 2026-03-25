@@ -224,7 +224,7 @@ impl<'a> RelayClient<'a> {
                         )?;
                     }
                 }
-                ParsedRange::Timestamps { upper_bound: _, timestamps: their_ts } => {
+                ParsedRange::Timestamps { upper_bound: ref ts_upper_bound, timestamps: their_ts } => {
                     // Pass 1: collect our timestamps
                     let mut our_ts: heapless::Vec<TimestampBytes, 256> = heapless::Vec::new();
                     let _ = storage.iterate(prev_index, upper, &mut |ts, _| {
@@ -240,19 +240,35 @@ impl<'a> RelayClient<'a> {
                         }
                     }
 
-                    // Pass 3: read and send changes (separate borrows)
-                    for ts in &to_send {
-                        if let Ok(Some(data)) = storage.read(ts) {
-                            let mut buf = [0u8; 4096];
-                            let len = data.len().min(buf.len());
-                            buf[..len].copy_from_slice(&data[..len]);
-                            let _ = builder.add_message(ts, &buf[..len]);
+                    // Check if they have timestamps we still need
+                    let mut we_need_theirs = false;
+                    for ts in their_ts {
+                        if !our_ts.contains(ts) {
+                            we_need_theirs = true;
+                            break;
                         }
                     }
 
-                    any_non_skip = true;
-                    let ub_ref = upper_bound_ts.as_ref();
-                    builder.add_timestamps_range(ub_ref, &our_ts)?;
+                    if to_send.is_empty() && !we_need_theirs {
+                        // Both sides have the same timestamps — skip
+                        if any_non_skip {
+                            match ts_upper_bound {
+                                RangeUpperBound::Infinite => builder.add_skip_range(None)?,
+                                RangeUpperBound::Timestamp(ts) => builder.add_skip_range(Some(ts))?,
+                            }
+                        }
+                    } else {
+                        // Pass 3: read and send changes (separate borrows)
+                        for ts in &to_send {
+                            if let Ok(Some(data)) = storage.read(ts) {
+                                let _ = builder.add_message(ts, data);
+                            }
+                        }
+
+                        any_non_skip = true;
+                        let ub_ref = upper_bound_ts.as_ref();
+                        builder.add_timestamps_range(ub_ref, &our_ts)?;
+                    }
                 }
             }
 
@@ -283,8 +299,11 @@ impl<'a> RelayClient<'a> {
         // Header
         let version = decode_varint(&mut buf).map_err(|_| HandleError::ParseError)?;
         if version != PROTOCOL_VERSION {
+            // Version mismatch: relay responds with just version + ownerId (no messageType).
+            // Consume the ownerId if present, then signal version mismatch.
+            let _ = buf.shift_n(16);
             self.state = SyncState::Error;
-            return Err(HandleError::ParseError);
+            return Err(HandleError::VersionMismatch);
         }
 
         let _owner_id = buf.shift_n(16).map_err(|_| HandleError::ParseError)?;
@@ -295,7 +314,13 @@ impl<'a> RelayClient<'a> {
                 let error_code = buf.shift().map_err(|_| HandleError::ParseError)?;
                 if error_code != ERROR_NONE {
                     self.state = SyncState::Error;
-                    return Err(HandleError::ParseError);
+                    return Err(match error_code {
+                        ERROR_WRITE_KEY => HandleError::WriteKeyError,
+                        ERROR_WRITE => HandleError::WriteError,
+                        ERROR_QUOTA => HandleError::QuotaError,
+                        ERROR_SYNC => HandleError::SyncError,
+                        _ => HandleError::ParseError,
+                    });
                 }
             }
             MESSAGE_TYPE_BROADCAST => {}
@@ -454,18 +479,17 @@ impl<'a> RelayClient<'a> {
                 builder.add_timestamps_range(upper_bound_ts, &timestamps)?;
             }
             Ok(bucket_boundaries) => {
+                // Offset bucket boundaries by lower to get absolute positions.
+                // When lower > 0, TS does fingerprintRanges(buckets).slice(1),
+                // which skips the [0, lower) range. We achieve the same by
+                // just offsetting without prepending lower.
                 let adjusted: heapless::Vec<u32, 16> = if lower == 0 {
                     bucket_boundaries.clone()
                 } else {
-                    let mut v = heapless::Vec::new();
-                    let _ = v.push(lower);
-                    for &b in bucket_boundaries.iter() {
-                        let _ = v.push(b + lower);
-                    }
-                    v
+                    bucket_boundaries.iter().map(|&b| b + lower).collect()
                 };
 
-                let mut prev = if lower == 0 { 0 } else { lower };
+                let mut prev = lower;
                 for (i, &boundary) in adjusted.iter().enumerate() {
                     let fp = storage.fingerprint(prev, boundary).unwrap_or(ZERO_FINGERPRINT);
                     let is_last = i == adjusted.len() - 1;
@@ -654,7 +678,7 @@ mod tests {
         let oid = test_owner_id();
         let ek = test_enc_key();
         let (mut transport, _relay) = create_mock_pair();
-        transport.connect().unwrap();
+        transport.connect(&[0u8; 16]).unwrap();
 
         let mut client = RelayClient::new(&oid, &ek, None);
         let mut storage = TestStorage::new();

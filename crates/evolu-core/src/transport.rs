@@ -49,12 +49,13 @@ pub enum TransportError {
 /// connect() → [Connected] → send() / on_message callback → disconnect()
 /// ```
 pub trait Transport {
-    /// Connect to the relay.
+    /// Connect to the relay for the given owner.
     ///
     /// The host knows the network endpoint — the device doesn't need
-    /// to specify an address. The host-side transport proxy handles
-    /// DNS resolution, TLS, WebSocket handshake, etc.
-    fn connect(&mut self) -> Result<(), TransportError>;
+    /// to specify an address. The `owner_id` tells the host which owner
+    /// to connect for, so the host can independently sync with the relay
+    /// (e.g., cache data while the device is disconnected).
+    fn connect(&mut self, owner_id: &[u8; 16]) -> Result<(), TransportError>;
 
     /// Disconnect from the relay.
     fn disconnect(&mut self);
@@ -94,6 +95,16 @@ pub enum HandleError {
     StorageError,
     /// Message was too large to process.
     TooLarge,
+    /// Protocol version mismatch — relay uses a different version.
+    VersionMismatch,
+    /// Relay rejected the write key.
+    WriteKeyError,
+    /// Relay write failed.
+    WriteError,
+    /// Relay quota exceeded.
+    QuotaError,
+    /// Relay sync error.
+    SyncError,
 }
 
 /// Mock transport for testing.
@@ -207,7 +218,7 @@ pub mod mock {
     }
 
     impl Transport for MockTransport {
-        fn connect(&mut self) -> Result<(), TransportError> {
+        fn connect(&mut self, _owner_id: &[u8; 16]) -> Result<(), TransportError> {
             self.state = ConnectionState::Connected;
             Ok(())
         }
@@ -265,8 +276,8 @@ mod tests {
     #[test]
     fn mock_pair_send_and_deliver() {
         let (mut a, mut b) = create_mock_pair();
-        a.connect().unwrap();
-        b.connect().unwrap();
+        a.connect(&[0u8; 16]).unwrap();
+        b.connect(&[0u8; 16]).unwrap();
 
         a.send(b"hello from a").unwrap();
         b.send(b"hello from b").unwrap();
@@ -291,7 +302,7 @@ mod tests {
     #[test]
     fn mock_no_pending_messages() {
         let (mut a, _b) = create_mock_pair();
-        a.connect().unwrap();
+        a.connect(&[0u8; 16]).unwrap();
 
         let mut collector = MessageCollector::new();
         assert_eq!(a.deliver_pending(&mut collector), 0);
@@ -301,8 +312,8 @@ mod tests {
     #[test]
     fn mock_fifo_ordering() {
         let (mut a, mut b) = create_mock_pair();
-        a.connect().unwrap();
-        b.connect().unwrap();
+        a.connect(&[0u8; 16]).unwrap();
+        b.connect(&[0u8; 16]).unwrap();
 
         a.send(b"first").unwrap();
         a.send(b"second").unwrap();
@@ -319,8 +330,8 @@ mod tests {
     #[test]
     fn mock_deliver_one() {
         let (mut a, mut b) = create_mock_pair();
-        a.connect().unwrap();
-        b.connect().unwrap();
+        a.connect(&[0u8; 16]).unwrap();
+        b.connect(&[0u8; 16]).unwrap();
 
         a.send(b"msg1").unwrap();
         a.send(b"msg2").unwrap();
@@ -342,7 +353,7 @@ mod tests {
     #[test]
     fn mock_inject_message() {
         let (mut a, _b) = create_mock_pair();
-        a.connect().unwrap();
+        a.connect(&[0u8; 16]).unwrap();
 
         a.inject_message(b"injected relay response");
 
@@ -354,8 +365,8 @@ mod tests {
     #[test]
     fn mock_disconnect_and_reconnect() {
         let (mut a, mut b) = create_mock_pair();
-        a.connect().unwrap();
-        b.connect().unwrap();
+        a.connect(&[0u8; 16]).unwrap();
+        b.connect(&[0u8; 16]).unwrap();
 
         a.send(b"before").unwrap();
         a.disconnect();
@@ -368,7 +379,7 @@ mod tests {
         assert_eq!(collector.messages[0], b"before");
 
         // Reconnect works
-        a.connect().unwrap();
+        a.connect(&[0u8; 16]).unwrap();
         a.send(b"after").unwrap();
         b.deliver_pending(&mut collector);
         assert_eq!(collector.messages[1], b"after");
@@ -377,8 +388,8 @@ mod tests {
     #[test]
     fn mock_has_message() {
         let (mut a, mut b) = create_mock_pair();
-        a.connect().unwrap();
-        b.connect().unwrap();
+        a.connect(&[0u8; 16]).unwrap();
+        b.connect(&[0u8; 16]).unwrap();
 
         assert!(!b.has_message());
         a.send(b"test").unwrap();

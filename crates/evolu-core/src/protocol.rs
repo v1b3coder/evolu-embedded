@@ -462,8 +462,7 @@ pub fn encode_and_encrypt_db_change(
     output: &mut Buffer,
 ) -> Result<(), BufferError> {
     // Build plaintext in a temporary buffer
-    // Max size estimate: we work within the output buffer's remaining space
-    let mut plaintext_buf = [0u8; 2048];
+    let mut plaintext_buf = [0u8; 8192];
     let mut pt = Buffer::new(&mut plaintext_buf);
 
     // 1. Protocol version
@@ -505,7 +504,7 @@ pub fn encode_and_encrypt_db_change(
     let xnonce = XNonce::from_slice(nonce);
 
     // Copy plaintext for encryption
-    let mut ct_buf = [0u8; 2048];
+    let mut ct_buf = [0u8; 8192];
     ct_buf[..plaintext_len].copy_from_slice(&plaintext_buf[..plaintext_len]);
 
     let tag = cipher
@@ -556,7 +555,10 @@ pub fn decrypt_db_change(
     }
 
     let plaintext_len = ct_len - 16;
-    let mut plaintext = [0u8; 2048];
+    if plaintext_len > 8192 {
+        return Err(ProtocolError::InvalidData);
+    }
+    let mut plaintext = [0u8; 8192];
     plaintext[..plaintext_len].copy_from_slice(&ciphertext_with_tag[..plaintext_len]);
     let tag = Tag::from_slice(&ciphertext_with_tag[plaintext_len..]);
 

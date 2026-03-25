@@ -145,8 +145,8 @@ fn run_client<S: StorageBackend>(
 
     // Connect and sync
     println!("  Syncing...");
-    let mut ws = WsTransport::new(relay_url, &owner.id);
-    ws.connect()
+    let mut ws = WsTransport::new(relay_url);
+    ws.connect(&owner.id)
         .unwrap_or_else(|_| panic!("Client {}: relay connection failed", name));
 
     let mut client = RelayClient::new(&owner.id, &owner.encryption_key, Some(&owner.write_key));
