@@ -298,10 +298,8 @@ mod tests {
 
         // Build initial sync request (empty storage)
         let mut client = RelayClient::new(&owner.id, &owner.encryption_key, None);
-        let mut no_fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-        let mut no_iter =
-            |_: u32, _: u32, _: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {};
-        client.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
+        let mut empty_storage = evolu_file_store::FileStorage::new();
+        client.start_sync(&mut empty_storage).unwrap();
 
         let msg = client.pending_send().unwrap().to_vec();
         println!("Sending sync request ({} bytes)...", msg.len());
@@ -409,11 +407,8 @@ mod tests {
 
         // Wait for relay response
         let mut client_a = RelayClient::new(&owner.id, &owner.encryption_key, Some(&owner.write_key));
-        // Manually set state to WaitingForResponse since we built the message manually
-        let mut no_fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-        let mut no_iter =
-            |_: u32, _: u32, _: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {};
-        client_a.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
+        let mut empty_a = evolu_file_store::FileStorage::new();
+        client_a.start_sync(&mut empty_a).unwrap();
         // Consume the auto-generated message (we already sent our manual one)
         let _ = client_a.pending_send();
 
@@ -432,9 +427,8 @@ mod tests {
         ws_b.connect().expect("Client B: connection failed");
 
         let mut client_b = RelayClient::new(&owner.id, &owner.encryption_key, Some(&owner.write_key));
-
-        // Client B has empty storage
-        client_b.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
+        let mut empty_b = evolu_file_store::FileStorage::new();
+        client_b.start_sync(&mut empty_b).unwrap();
         let sync_msg = client_b.pending_send().unwrap().to_vec();
         println!("Client B: sending sync request ({} bytes)", sync_msg.len());
 

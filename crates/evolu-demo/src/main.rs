@@ -149,53 +149,69 @@ fn run_client<S: StorageBackend>(
     ws.connect()
         .unwrap_or_else(|_| panic!("Client {}: relay connection failed", name));
 
-    let after_count = storage.size().unwrap();
-
-    // Build protocol message: our new CRDT message + our timestamp list
-    let mut builder = MessageBuilder::new_request(
-        &owner.id,
-        Some(&owner.write_key),
-        SUBSCRIPTION_SUBSCRIBE,
-    )
-    .unwrap();
-    builder.add_message(&ts, &encrypted_change).unwrap();
-
-    let mut all_ts: Vec<TimestampBytes> = Vec::new();
-    storage
-        .iterate(0, after_count, &mut |t, _| {
-            all_ts.push(*t);
-            true
-        })
-        .unwrap();
-    builder.add_timestamps_range(None, &all_ts).unwrap();
-
-    let mut msg_buf = [0u8; 16384];
-    let msg_len = builder.finalize(&mut msg_buf).unwrap();
-    ws.send(&msg_buf[..msg_len]).unwrap();
-
-    // Receive relay response
     let mut client = RelayClient::new(&owner.id, &owner.encryption_key, Some(&owner.write_key));
-    let mut no_fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-    let mut no_iter = |_: u32, _: u32, _: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {};
-    client.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
-    let _ = client.pending_send();
 
-    ws.poll_timeout(&mut client, Duration::from_secs(5))
-        .unwrap_or_else(|_| panic!("Client {}: relay timeout", name));
+    // Build initial request with our new message + storage state
+    {
+        let count = storage.size().unwrap();
+        let mut builder = MessageBuilder::new_request(
+            &owner.id,
+            Some(&owner.write_key),
+            SUBSCRIPTION_SUBSCRIBE,
+        )
+        .unwrap();
+        builder.add_message(&ts, &encrypted_change).unwrap();
 
-    // Store received CRDT messages locally
-    let received_ts = client.received_timestamps().to_vec();
-    let received_ch = client.received_changes().to_vec();
+        let mut all_ts: Vec<TimestampBytes> = Vec::new();
+        storage.iterate(0, count, &mut |t, _| { all_ts.push(*t); true }).unwrap();
+        builder.add_timestamps_range(None, &all_ts).unwrap();
 
-    for (i, relay_ts) in received_ts.iter().enumerate() {
-        if i < received_ch.len() {
-            storage.insert(relay_ts, &received_ch[i]).unwrap();
+        let mut msg_buf = [0u8; 16384];
+        let msg_len = builder.finalize(&mut msg_buf).unwrap();
+        ws.send(&msg_buf[..msg_len]).unwrap();
+    }
+
+    // Set client state so on_message works
+    client.start_sync(storage).unwrap();
+    let _ = client.pending_send(); // discard auto-generated message
+
+    // Multi-round sync loop
+    let before_sync = storage.size().unwrap();
+    let max_rounds = 10;
+
+    for round in 0..max_rounds {
+        ws.poll_timeout(&mut client, Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("Client {}: relay timeout (round {})", name, round));
+
+        // Store received messages
+        let received_ts = client.received_timestamps().to_vec();
+        let received_ch = client.received_changes().to_vec();
+        for (i, relay_ts) in received_ts.iter().enumerate() {
+            if i < received_ch.len() {
+                storage.insert(relay_ts, &received_ch[i]).unwrap();
+            } else {
+                storage.insert(relay_ts, &[]).unwrap();
+            }
+        }
+
+        if client.is_synced() {
+            if round > 0 {
+                println!("  Synced in {} rounds", round + 1);
+            }
+            break;
+        }
+
+        // Build follow-up from response ranges
+        client.continue_sync(storage).unwrap();
+
+        if let Some(msg) = client.pending_send() {
+            ws.send(msg).unwrap();
         } else {
-            storage.insert(relay_ts, &[]).unwrap();
+            break;
         }
     }
 
-    let actual_new = storage.size().unwrap() - after_count;
+    let actual_new = storage.size().unwrap() - before_sync;
     if actual_new > 0 {
         println!("  Received {} new entry/entries from relay", actual_new);
     }

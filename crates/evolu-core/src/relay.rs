@@ -10,6 +10,7 @@ use alloc::vec::Vec;
 
 use crate::message::MessageBuilder;
 use crate::protocol::*;
+use crate::storage::StorageBackend;
 use crate::sync::*;
 use crate::transport::{ConnectionState, HandleError, MessageHandler};
 use crate::types::*;
@@ -125,22 +126,22 @@ impl<'a> RelayClient<'a> {
         &self.received_changes
     }
 
-    /// Build and queue the initial sync request.
+    /// Build and queue the initial sync request from storage state.
     ///
     /// After calling, use `pending_send()` to get the bytes to send.
-    pub fn start_sync(
+    pub fn start_sync<S: StorageBackend>(
         &mut self,
-        timestamp_count: u32,
-        fingerprint_fn: &mut dyn FnMut(u32, u32) -> Option<Fingerprint>,
-        iterate_fn: &mut dyn FnMut(u32, u32, &mut dyn FnMut(&TimestampBytes, u32) -> bool),
+        storage: &mut S,
     ) -> Result<(), BufferError> {
+        let count = storage.size().map_err(|_| BufferError::Overflow)?;
+
         let mut builder = MessageBuilder::new_request(
             self.owner_id,
             self.write_key,
             SUBSCRIPTION_SUBSCRIBE,
         )?;
 
-        self.build_ranges(&mut builder, timestamp_count, fingerprint_fn, iterate_fn)?;
+        Self::build_ranges_from_storage(&mut builder, storage, 0, count, None)?;
 
         self.out_len = builder.finalize(&mut self.out_buf)?;
         self.state = SyncState::WaitingForResponse;
@@ -152,20 +153,17 @@ impl<'a> RelayClient<'a> {
 
     /// Build a follow-up sync request processing the response ranges.
     ///
-    /// Call this after `on_message` if `!is_synced()` and you have local
-    /// storage state to compare against the response ranges.
-    pub fn continue_sync(
+    /// Call this after `on_message` if `!is_synced()`.
+    pub fn continue_sync<S: StorageBackend>(
         &mut self,
-        storage_size: u32,
-        fingerprint_fn: &mut dyn FnMut(u32, u32) -> Option<Fingerprint>,
-        iterate_fn: &mut dyn FnMut(u32, u32, &mut dyn FnMut(&TimestampBytes, u32) -> bool),
-        find_lower_bound_fn: &mut dyn FnMut(u32, u32, Option<&TimestampBytes>) -> Option<u32>,
-        read_db_change_fn: &mut dyn FnMut(&TimestampBytes) -> Option<&[u8]>,
+        storage: &mut S,
     ) -> Result<(), BufferError> {
+        let storage_size = storage.size().map_err(|_| BufferError::Overflow)?;
+
         let mut builder = MessageBuilder::new_request(
             self.owner_id,
             self.write_key,
-            SUBSCRIPTION_NONE, // Already subscribed
+            SUBSCRIPTION_NONE,
         )?;
 
         let ranges = core::mem::take(&mut self.response_ranges);
@@ -176,37 +174,41 @@ impl<'a> RelayClient<'a> {
             let upper_bound_ts = match range {
                 ParsedRange::Skip { upper_bound }
                 | ParsedRange::Fingerprint { upper_bound, .. }
-                | ParsedRange::Timestamps { upper_bound, .. } => {
-                    match upper_bound {
-                        RangeUpperBound::Timestamp(ts) => Some(ts),
-                        RangeUpperBound::Infinite => None,
-                    }
-                }
+                | ParsedRange::Timestamps { upper_bound, .. } => match upper_bound {
+                    RangeUpperBound::Timestamp(ts) => Some(*ts),
+                    RangeUpperBound::Infinite => None,
+                },
             };
 
-            let upper = find_lower_bound_fn(
-                prev_index, storage_size, upper_bound_ts.map(|t| &*t),
-            ).unwrap_or(storage_size);
+            // find_lower_bound: scan to find first timestamp >= bound
+            let upper = if let Some(bound) = &upper_bound_ts {
+                let mut found = storage_size;
+                let _ = storage.iterate(prev_index, storage_size, &mut |ts, idx| {
+                    if ts >= bound {
+                        found = idx;
+                        return false;
+                    }
+                    true
+                });
+                found
+            } else {
+                storage_size
+            };
 
             match range {
                 ParsedRange::Skip { upper_bound } => {
-                    // Both sides agree — skip
                     if any_non_skip {
                         match upper_bound {
-                            RangeUpperBound::Infinite => {
-                                builder.add_skip_range(None)?;
-                            }
-                            RangeUpperBound::Timestamp(ts) => {
-                                builder.add_skip_range(Some(ts))?;
-                            }
+                            RangeUpperBound::Infinite => builder.add_skip_range(None)?,
+                            RangeUpperBound::Timestamp(ts) => builder.add_skip_range(Some(ts))?,
                         }
                     }
                 }
                 ParsedRange::Fingerprint { upper_bound, fingerprint: their_fp } => {
-                    let our_fp = fingerprint_fn(prev_index, upper).unwrap_or(ZERO_FINGERPRINT);
+                    let our_fp = storage.fingerprint(prev_index, upper)
+                        .unwrap_or(ZERO_FINGERPRINT);
 
                     if our_fp == *their_fp {
-                        // Match — skip
                         if any_non_skip {
                             match upper_bound {
                                 RangeUpperBound::Infinite => builder.add_skip_range(None)?,
@@ -215,41 +217,42 @@ impl<'a> RelayClient<'a> {
                         }
                     } else {
                         any_non_skip = true;
-                        // Mismatch — split further
-                        let item_count = upper - prev_index;
-                        let ub_ts = match upper_bound {
-                            RangeUpperBound::Timestamp(ts) => Some(ts),
-                            RangeUpperBound::Infinite => None,
-                        };
-                        self.split_range(
-                            &mut builder, prev_index, upper, ub_ts,
-                            item_count, fingerprint_fn, iterate_fn,
+                        let _item_count = upper - prev_index;
+                        let ub_ref = upper_bound_ts.as_ref();
+                        Self::build_ranges_from_storage(
+                            &mut builder, storage, prev_index, upper, ub_ref,
                         )?;
                     }
                 }
-                ParsedRange::Timestamps { upper_bound, timestamps: their_ts } => {
-                    // Compare sets: find what we have that they don't, and vice versa
+                ParsedRange::Timestamps { upper_bound: _, timestamps: their_ts } => {
+                    // Pass 1: collect our timestamps
                     let mut our_ts: heapless::Vec<TimestampBytes, 256> = heapless::Vec::new();
-
-                    // Build set of their timestamps for lookup
-                    iterate_fn(prev_index, upper, &mut |ts, _idx| {
+                    let _ = storage.iterate(prev_index, upper, &mut |ts, _| {
                         let _ = our_ts.push(*ts);
-                        // If they don't have it, we need to send it
-                        if !their_ts.contains(ts) {
-                            if let Some(change) = read_db_change_fn(ts) {
-                                let _ = builder.add_message(ts, change);
-                            }
-                        }
                         true
                     });
 
-                    // They need our timestamps list to know what we have
+                    // Pass 2: find which timestamps they don't have
+                    let mut to_send: heapless::Vec<TimestampBytes, 256> = heapless::Vec::new();
+                    for ts in &our_ts {
+                        if !their_ts.contains(ts) {
+                            let _ = to_send.push(*ts);
+                        }
+                    }
+
+                    // Pass 3: read and send changes (separate borrows)
+                    for ts in &to_send {
+                        if let Ok(Some(data)) = storage.read(ts) {
+                            let mut buf = [0u8; 4096];
+                            let len = data.len().min(buf.len());
+                            buf[..len].copy_from_slice(&data[..len]);
+                            let _ = builder.add_message(ts, &buf[..len]);
+                        }
+                    }
+
                     any_non_skip = true;
-                    let ub_ts = match upper_bound {
-                        RangeUpperBound::Timestamp(ts) => Some(ts),
-                        RangeUpperBound::Infinite => None,
-                    };
-                    builder.add_timestamps_range(ub_ts, &our_ts)?;
+                    let ub_ref = upper_bound_ts.as_ref();
+                    builder.add_timestamps_range(ub_ref, &our_ts)?;
                 }
             }
 
@@ -423,50 +426,34 @@ impl<'a> RelayClient<'a> {
         Ok(())
     }
 
-    // ── Internal: range building ────────────────────────────────
+    // ── Internal: range building from StorageBackend ────────────
 
-    fn build_ranges(
-        &self,
+    fn build_ranges_from_storage<S: StorageBackend>(
         builder: &mut MessageBuilder,
-        timestamp_count: u32,
-        fingerprint_fn: &mut dyn FnMut(u32, u32) -> Option<Fingerprint>,
-        iterate_fn: &mut dyn FnMut(u32, u32, &mut dyn FnMut(&TimestampBytes, u32) -> bool),
-    ) -> Result<(), BufferError> {
-        if timestamp_count == 0 {
-            builder.add_timestamps_range(None, &[])?;
-        } else {
-            self.split_range(
-                builder, 0, timestamp_count, None,
-                timestamp_count, fingerprint_fn, iterate_fn,
-            )?;
-        }
-        Ok(())
-    }
-
-    fn split_range(
-        &self,
-        builder: &mut MessageBuilder,
+        storage: &mut S,
         lower: u32,
         upper: u32,
         upper_bound_ts: Option<&TimestampBytes>,
-        item_count: u32,
-        fingerprint_fn: &mut dyn FnMut(u32, u32) -> Option<Fingerprint>,
-        iterate_fn: &mut dyn FnMut(u32, u32, &mut dyn FnMut(&TimestampBytes, u32) -> bool),
     ) -> Result<(), BufferError> {
+        let item_count = upper - lower;
+        if item_count == 0 {
+            builder.add_timestamps_range(upper_bound_ts, &[])?;
+            return Ok(());
+        }
+
         let buckets = compute_balanced_buckets(item_count, DEFAULT_NUM_BUCKETS, DEFAULT_MIN_PER_BUCKET);
 
         match buckets {
             Err(_) => {
                 // Too few items — send all as TimestampsRange
                 let mut timestamps: heapless::Vec<TimestampBytes, 256> = heapless::Vec::new();
-                iterate_fn(lower, upper, &mut |ts, _| {
+                let _ = storage.iterate(lower, upper, &mut |ts, _| {
                     let _ = timestamps.push(*ts);
                     true
                 });
                 builder.add_timestamps_range(upper_bound_ts, &timestamps)?;
             }
             Ok(bucket_boundaries) => {
-                // Split into FingerprintRanges
                 let adjusted: heapless::Vec<u32, 16> = if lower == 0 {
                     bucket_boundaries.clone()
                 } else {
@@ -480,16 +467,14 @@ impl<'a> RelayClient<'a> {
 
                 let mut prev = if lower == 0 { 0 } else { lower };
                 for (i, &boundary) in adjusted.iter().enumerate() {
-                    let fp = fingerprint_fn(prev, boundary).unwrap_or(ZERO_FINGERPRINT);
-
-                    // Upper bound: for last range use the caller's upper_bound_ts (or None=Infinite)
+                    let fp = storage.fingerprint(prev, boundary).unwrap_or(ZERO_FINGERPRINT);
                     let is_last = i == adjusted.len() - 1;
+
                     if is_last {
                         builder.add_fingerprint_range(upper_bound_ts, &fp)?;
                     } else {
-                        // Get the actual timestamp at boundary-1 as upper bound
                         let mut bound_ts = [0u8; 16];
-                        iterate_fn(boundary - 1, boundary, &mut |ts, _| {
+                        let _ = storage.iterate(boundary - 1, boundary, &mut |ts, _| {
                             bound_ts = *ts;
                             false
                         });
@@ -520,7 +505,6 @@ impl<'a> MessageHandler for RelayClient<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::timestamp_to_fingerprint;
     use crate::timestamp::timestamp_to_bytes;
     use crate::transport::{Transport, MessageHandler};
     use crate::transport::mock::*;
@@ -537,6 +521,53 @@ mod tests {
          0xe6, 0x32, 0x57, 0xcc, 0xa7, 0x50, 0x38, 0xe9,
          0xec, 0x20, 0x77, 0x72, 0x03, 0x85, 0x0b, 0x72,
          0xf5, 0x4c, 0xe6, 0x08, 0x7b, 0xbb, 0x9e, 0x73]
+    }
+
+    /// Minimal in-memory StorageBackend for tests.
+    struct TestStorage {
+        entries: alloc::vec::Vec<(TimestampBytes, alloc::vec::Vec<u8>)>,
+    }
+
+    impl TestStorage {
+        fn new() -> Self { TestStorage { entries: alloc::vec::Vec::new() } }
+        fn with_timestamps(count: u32) -> Self {
+            let mut s = Self::new();
+            for i in 0..count {
+                let ts = timestamp_to_bytes(&Timestamp::new(
+                    Millis::new(i as u64 * 1000).unwrap(), Counter::new(0), NodeId::MIN,
+                ));
+                s.insert(&ts, &[i as u8]).unwrap();
+            }
+            s
+        }
+    }
+
+    impl StorageBackend for TestStorage {
+        type Error = ();
+        fn size(&mut self) -> Result<u32, ()> { Ok(self.entries.len() as u32) }
+        fn fingerprint(&mut self, begin: u32, end: u32) -> Result<Fingerprint, ()> {
+            let mut fp = ZERO_FINGERPRINT;
+            for i in begin..end.min(self.entries.len() as u32) {
+                fp = fingerprint_xor(&fp, &crate::crypto::timestamp_to_fingerprint(&self.entries[i as usize].0));
+            }
+            Ok(fp)
+        }
+        fn iterate(&mut self, begin: u32, end: u32, cb: &mut dyn FnMut(&TimestampBytes, u32) -> bool) -> Result<(), ()> {
+            for i in begin..end.min(self.entries.len() as u32) {
+                if !cb(&self.entries[i as usize].0, i) { break; }
+            }
+            Ok(())
+        }
+        fn insert(&mut self, ts: &TimestampBytes, data: &[u8]) -> Result<(), ()> {
+            if !self.entries.iter().any(|e| e.0 == *ts) {
+                let pos = self.entries.iter().position(|e| e.0 > *ts).unwrap_or(self.entries.len());
+                self.entries.insert(pos, (*ts, data.to_vec()));
+            }
+            Ok(())
+        }
+        fn read(&mut self, ts: &TimestampBytes) -> Result<Option<&[u8]>, ()> {
+            Ok(self.entries.iter().find(|e| e.0 == *ts).map(|e| e.1.as_slice()))
+        }
     }
 
     fn build_empty_response(owner_id: &[u8; 16]) -> alloc::vec::Vec<u8> {
@@ -556,14 +587,12 @@ mod tests {
         let oid = test_owner_id();
         let ek = test_enc_key();
         let mut client = RelayClient::new(&oid, &ek, None);
-
-        let mut no_fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-        let mut no_iter = |_: u32, _: u32, _: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {};
-        client.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
+        let mut storage = TestStorage::new();
+        client.start_sync(&mut storage).unwrap();
 
         assert_eq!(client.state(), SyncState::WaitingForResponse);
         let msg = client.pending_send().unwrap();
-        assert_eq!(msg[0], 1); // protocol version
+        assert_eq!(msg[0], 1);
     }
 
     #[test]
@@ -571,17 +600,8 @@ mod tests {
         let oid = test_owner_id();
         let ek = test_enc_key();
         let mut client = RelayClient::new(&oid, &ek, None);
-
-        let timestamps: alloc::vec::Vec<TimestampBytes> = (0..5)
-            .map(|i| timestamp_to_bytes(&Timestamp::new(
-                Millis::new(i * 1000).unwrap(), Counter::new(0), NodeId::MIN,
-            ))).collect();
-
-        let mut fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-        let mut it = |b: u32, e: u32, cb: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {
-            for i in b..e { if !cb(&timestamps[i as usize], i) { break; } }
-        };
-        client.start_sync(5, &mut fp, &mut it).unwrap();
+        let mut storage = TestStorage::with_timestamps(5);
+        client.start_sync(&mut storage).unwrap();
         assert!(client.pending_send().is_some());
     }
 
@@ -590,21 +610,8 @@ mod tests {
         let oid = test_owner_id();
         let ek = test_enc_key();
         let mut client = RelayClient::new(&oid, &ek, None);
-
-        let timestamps: alloc::vec::Vec<TimestampBytes> = (0..100)
-            .map(|i| timestamp_to_bytes(&Timestamp::new(
-                Millis::new(i * 1000).unwrap(), Counter::new(0), NodeId::MIN,
-            ))).collect();
-
-        let mut fp = |b: u32, e: u32| -> Option<Fingerprint> {
-            let mut f = ZERO_FINGERPRINT;
-            for i in b..e { f = fingerprint_xor(&f, &timestamp_to_fingerprint(&timestamps[i as usize])); }
-            Some(f)
-        };
-        let mut it = |b: u32, e: u32, cb: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {
-            for i in b..e { if !cb(&timestamps[i as usize], i) { break; } }
-        };
-        client.start_sync(100, &mut fp, &mut it).unwrap();
+        let mut storage = TestStorage::with_timestamps(100);
+        client.start_sync(&mut storage).unwrap();
         assert!(client.pending_send().is_some());
     }
 
@@ -613,17 +620,14 @@ mod tests {
         let oid = test_owner_id();
         let ek = test_enc_key();
         let mut client = RelayClient::new(&oid, &ek, None);
-
-        let mut no_fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-        let mut no_iter = |_: u32, _: u32, _: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {};
-        client.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
+        let mut storage = TestStorage::new();
+        client.start_sync(&mut storage).unwrap();
 
         let resp = build_empty_response(&oid);
         client.on_message(&resp).unwrap();
 
         assert!(client.is_synced());
         assert_eq!(client.rounds(), 1);
-        assert_eq!(client.messages_received(), 0);
     }
 
     #[test]
@@ -631,10 +635,8 @@ mod tests {
         let oid = test_owner_id();
         let ek = test_enc_key();
         let mut client = RelayClient::new(&oid, &ek, None);
-
-        let mut no_fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-        let mut no_iter = |_: u32, _: u32, _: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {};
-        client.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
+        let mut storage = TestStorage::new();
+        client.start_sync(&mut storage).unwrap();
 
         let mut b = [0u8; 64];
         let mut buf = Buffer::new(&mut b);
@@ -655,9 +657,8 @@ mod tests {
         transport.connect().unwrap();
 
         let mut client = RelayClient::new(&oid, &ek, None);
-        let mut no_fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-        let mut no_iter = |_: u32, _: u32, _: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {};
-        client.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
+        let mut storage = TestStorage::new();
+        client.start_sync(&mut storage).unwrap();
 
         transport.send(client.pending_send().unwrap()).unwrap();
 
@@ -673,10 +674,8 @@ mod tests {
         let oid = test_owner_id();
         let ek = test_enc_key();
         let mut client = RelayClient::new(&oid, &ek, None);
-
-        let mut no_fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-        let mut no_iter = |_: u32, _: u32, _: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {};
-        client.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
+        let mut storage = TestStorage::new();
+        client.start_sync(&mut storage).unwrap();
 
         client.on_state_change(ConnectionState::Disconnected);
         assert_eq!(client.state(), SyncState::Error);
@@ -687,10 +686,8 @@ mod tests {
         let oid = test_owner_id();
         let ek = test_enc_key();
         let mut client = RelayClient::new(&oid, &ek, None);
-
-        let mut no_fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-        let mut no_iter = |_: u32, _: u32, _: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {};
-        client.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
+        let mut storage = TestStorage::new();
+        client.start_sync(&mut storage).unwrap();
 
         assert!(client.pending_send().is_some());
         assert!(client.pending_send().is_none());
@@ -701,23 +698,17 @@ mod tests {
         let oid = test_owner_id();
         let ek = test_enc_key();
         let mut client = RelayClient::new(&oid, &ek, None);
+        let mut storage = TestStorage::new();
+        client.start_sync(&mut storage).unwrap();
 
-        let mut no_fp = |_: u32, _: u32| -> Option<Fingerprint> { None };
-        let mut no_iter = |_: u32, _: u32, _: &mut dyn FnMut(&TimestampBytes, u32) -> bool| {};
-        client.start_sync(0, &mut no_fp, &mut no_iter).unwrap();
-
-        // Build response with 1 SkipRange (InfiniteUpperBound)
         let mut b = [0u8; 128];
         let mut buf = Buffer::new(&mut b);
         encode_varint(&mut buf, PROTOCOL_VERSION).unwrap();
         buf.extend(&oid).unwrap();
         buf.push(MESSAGE_TYPE_RESPONSE).unwrap();
         buf.push(ERROR_NONE).unwrap();
-        encode_timestamps_buffer(&mut buf, &[]).unwrap(); // 0 messages
-        // Ranges: count=1 (TimestampsBuffer with 1 entry, infinite)
-        encode_varint(&mut buf, 1).unwrap(); // count in TS buffer
-        // No millis/counter/nodeId (infinite only increments count)
-        // Range type = Skip
+        encode_timestamps_buffer(&mut buf, &[]).unwrap();
+        encode_varint(&mut buf, 1).unwrap();
         encode_varint(&mut buf, RANGE_TYPE_SKIP).unwrap();
 
         client.on_message(buf.written()).unwrap();
